@@ -1,180 +1,230 @@
 "use client";
 
-import React, { useState, useRef } from "react";
-import { AlertCircle, Loader2 } from "lucide-react";
-import { AudioUploader } from "@/components/AudioUploader";
-import { AudioPlayer } from "@/components/AudioPlayer";
-import { PipelineStatus } from "@/components/PipelineStatus";
-import { TranscriptViewer } from "@/components/TranscriptViewer";
-import { fetchJobStatus, uploadAudioForTranscription } from "@/lib/api";
-import { JobStatus, TranscriptSegment } from "@/types/transcript";
+import { useEffect, useRef, useState } from "react";
+import SummaryCard from "@/components/SummaryCard";
+import TranscriptViewer from "@/components/TranscriptViewer";
+import type {
+  ConversationLanguage,
+  JobStatusResponse,
+  SummaryLanguage,
+} from "@/types/transcript";
 
-export default function MultilingualTranscriptionDashboard() {
-  const [audioFile, setAudioFile] = useState<File | null>(null);
-  const [audioUrl, setAudioUrl] = useState<string | null>(null);
-  const [languageHint, setLanguageHint] = useState<string>("auto");
-  const [status, setStatus] = useState<JobStatus>("idle");
+const API_BASE = (process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000").replace(/\/+$/, "");
+
+const ALLOWED_EXTENSIONS = [".mp3", ".wav", ".m4a", ".ogg", ".flac"];
+
+const STATUS_LABELS: Record<string, string> = {
+  queued: "Queued for processing...",
+  normalizing: "Normalizing audio to 16 kHz mono WAV...",
+  diarizing: "Detecting speakers (PyAnnote)...",
+  transcribing: "Transcribing speech segments (WhisperX)...",
+  summarizing: "Generating structured summary (Local Ollama)...",
+  completed: "Completed",
+  failed: "Failed",
+};
+
+export default function HomePage() {
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [language, setLanguage] = useState<ConversationLanguage>("auto");
+  const [summaryLanguage, setSummaryLanguage] = useState<SummaryLanguage>("en");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [job, setJob] = useState<JobStatusResponse | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [segments, setSegments] = useState<TranscriptSegment[]>([]);
-  const [activeSegmentId, setActiveSegmentId] = useState<string | null>(null);
-  const [isPlaying, setIsPlaying] = useState<boolean>(false);
 
-  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const handleFileSelect = (file: File) => {
+  useEffect(() => {
+    return () => {
+      if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
+    };
+  }, []);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setErrorMsg(null);
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
-    setAudioFile(file);
-    setAudioUrl(URL.createObjectURL(file));
-    setSegments([]);
-    setStatus("idle");
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const lowerName = file.name.toLowerCase();
+    const isValidExt = ALLOWED_EXTENSIONS.some((ext) => lowerName.endsWith(ext));
+
+    if (file.type.startsWith("video/") || !isValidExt) {
+      setSelectedFile(null);
+      setErrorMsg("Only audio files (.mp3, .wav, .m4a, .ogg, .flac) are supported. Video files are not allowed.");
+      return;
+    }
+
+    setSelectedFile(file);
   };
 
-  const handleFileClear = () => {
-    if (audioUrl) URL.revokeObjectURL(audioUrl);
-    setAudioFile(null);
-    setAudioUrl(null);
-    setSegments([]);
-    setStatus("idle");
-    setErrorMsg(null);
+  const pollJobStatus = async (jobId: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/jobs/${jobId}`);
+      if (!res.ok) {
+        throw new Error(`Status check failed (${res.status})`);
+      }
+
+      const data: JobStatusResponse = await res.json();
+      setJob(data);
+
+      if (data.status === "completed") {
+        setIsSubmitting(false);
+        return;
+      }
+
+      if (data.status === "failed") {
+        setIsSubmitting(false);
+        setErrorMsg(data.error || "Transcription pipeline failed.");
+        return;
+      }
+
+      pollTimerRef.current = setTimeout(() => pollJobStatus(jobId), 3000);
+    } catch (err) {
+      setIsSubmitting(false);
+      setErrorMsg(err instanceof Error ? err.message : "Lost connection to backend.");
+    }
   };
 
-  const handleStartTranscription = async () => {
-    if (!audioFile) return;
+  const handleTranscribe = async () => {
+    if (!selectedFile) return;
+
+    if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
     setErrorMsg(null);
-    setStatus("queued");
+    setJob(null);
+    setIsSubmitting(true);
 
     try {
-      const { job_id } = await uploadAudioForTranscription(audioFile, languageHint);
+      const formData = new FormData();
+      formData.append("file", selectedFile);
+      formData.append("language", language);
+      formData.append("summary_language", summaryLanguage);
 
-      const poll = async () => {
-        const data = await fetchJobStatus(job_id);
-        setStatus(data.status);
+      const res = await fetch(`${API_BASE}/api/transcribe`, {
+        method: "POST",
+        body: formData,
+      });
 
-        if (data.status === "completed") {
-          setSegments(data.segments);
-          return;
-        }
-        if (data.status === "failed") {
-          setErrorMsg(data.error || "Transcription failed on the server.");
-          return;
-        }
-        setTimeout(poll, 2000);
-      };
+      if (!res.ok) {
+        const errBody = await res.json().catch(() => null);
+        throw new Error(errBody?.detail || `Upload failed (${res.status})`);
+      }
 
-      await poll();
+      const { job_id } = await res.json();
+      setJob({ job_id, status: "queued", progress: 0, segments: [] });
+      pollJobStatus(job_id);
     } catch (err) {
-      setStatus("failed");
-      setErrorMsg(
-        err instanceof Error
-          ? err.message
-          : "Could not reach backend API. Make sure FastAPI is running on port 8000."
-      );
+      setIsSubmitting(false);
+      setErrorMsg(err instanceof Error ? err.message : "Failed to start transcription.");
     }
   };
 
-  const handleSelectSegment = (segment: TranscriptSegment) => {
-    setActiveSegmentId(segment.id);
-    if (audioRef.current) {
-      audioRef.current.currentTime = segment.start;
-      audioRef.current.play();
-      setIsPlaying(true);
-    }
-  };
-
-  const isBusy =
-    status === "queued" ||
-    status === "normalizing" ||
-    status === "diarizing" ||
-    status === "transcribing";
+  const isProcessing =
+    isSubmitting || (job !== null && job.status !== "completed" && job.status !== "failed");
 
   return (
-    <div className="min-h-screen bg-[#F8FAFC] text-[#262626] p-6 md:p-10 font-sans">
-      <div className="max-w-5xl mx-auto space-y-6">
-        <header className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 border-b border-slate-200 pb-5">
-          <div>
-            <h1 className="text-3xl font-bold tracking-tight text-[#10594A]">
-              Multilingual Conversation Transcriber
-            </h1>
-            <p className="text-sm text-slate-600 mt-1">
-              Upload an audio recording to detect speakers, identify languages per turn, and generate timestamped transcripts.
-            </p>
-          </div>
-          <span className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-full bg-emerald-50 text-[#10594A] border border-emerald-200 self-start">
-            Audio-Only Mode (.mp3, .wav, .m4a, .ogg, .flac)
-          </span>
+    <main className="min-h-screen bg-[#fafaf8] px-4 py-10 text-neutral-900">
+      <div className="mx-auto max-w-4xl space-y-6">
+        <header className="space-y-1">
+          <h1 className="text-3xl font-bold tracking-tight text-[#10594A]">
+            Multilingual Lecture & Meeting Summarizer
+          </h1>
+          <p className="text-sm text-neutral-600">
+            Upload audio-only recordings for speaker diarization, multilingual transcription, and local AI summaries.
+          </p>
         </header>
 
-        <section className="bg-white rounded-xl border border-slate-200 p-6 shadow-sm space-y-5">
-          <AudioUploader
-            audioFile={audioFile}
-            onFileSelect={handleFileSelect}
-            onFileClear={handleFileClear}
-            onValidationError={(msg) => setErrorMsg(msg)}
-          />
+        <section className="rounded-2xl border border-neutral-200 bg-white p-6 shadow-sm space-y-5">
+          <div>
+            <label className="block text-sm font-medium text-neutral-800 mb-2">
+              Audio File (.mp3, .wav, .m4a, .ogg, .flac)
+            </label>
+            <input
+              type="file"
+              accept=".mp3,.wav,.m4a,.ogg,.flac,audio/*"
+              onChange={handleFileChange}
+              disabled={isProcessing}
+              className="block w-full rounded-xl border border-dashed border-neutral-300 bg-neutral-50 p-4 text-sm text-neutral-700 file:mr-4 file:rounded-lg file:border-0 file:bg-[#10594A] file:px-4 file:py-2 file:text-sm file:font-medium file:text-white hover:file:bg-[#065C43] disabled:opacity-50"
+            />
+            {selectedFile && (
+              <p className="mt-2 text-xs text-neutral-500">
+                Selected: <span className="font-medium text-neutral-800">{selectedFile.name}</span>{" "}
+                ({(selectedFile.size / (1024 * 1024)).toFixed(2)} MB)
+              </p>
+            )}
+          </div>
 
-          {audioFile && (
-            <div className="space-y-4">
-              <AudioPlayer
-                audioUrl={audioUrl}
-                audioRef={audioRef}
-                onPlayStateChange={setIsPlaying}
-              />
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-neutral-800 mb-1">
+                Conversation Language
+              </label>
+              <select
+                value={language}
+                onChange={(e) => setLanguage(e.target.value as ConversationLanguage)}
+                disabled={isProcessing}
+                className="w-full rounded-xl border border-neutral-300 bg-white px-3 py-2.5 text-sm text-neutral-800 focus:border-[#10594A] focus:outline-none"
+              >
+                <option value="auto">Auto-Detect (Multilingual)</option>
+                <option value="en">Single Language — English</option>
+                <option value="hi">Single Language — Hindi (हिन्दी)</option>
+                <option value="kn">Single Language — Kannada (ಕನ್ನಡ)</option>
+              </select>
+            </div>
 
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pt-2">
-                <div className="flex items-center gap-3">
-                  <label className="text-sm font-medium text-slate-700">
-                    Conversation Mode:
-                  </label>
-                  <select
-                    value={languageHint}
-                    onChange={(e) => setLanguageHint(e.target.value)}
-                    disabled={isBusy}
-                    className="text-sm border border-slate-300 rounded-lg px-3 py-1.5 bg-white focus:outline-none focus:border-[#10594A]"
-                  >
-                    <option value="auto">Auto-Detect Per Turn (Multilingual)</option>
-                    <option value="en-hi">Bilingual: English + Hindi (Hinglish)</option>
-                    <option value="en-kn">Bilingual: English + Kannada</option>
-                    <option value="en-es">Bilingual: English + Spanish</option>
-                  </select>
-                </div>
+            <div>
+              <label className="block text-sm font-medium text-neutral-800 mb-1">
+                Summary Output Language
+              </label>
+              <select
+                value={summaryLanguage}
+                onChange={(e) => setSummaryLanguage(e.target.value as SummaryLanguage)}
+                disabled={isProcessing}
+                className="w-full rounded-xl border border-neutral-300 bg-white px-3 py-2.5 text-sm text-neutral-800 focus:border-[#10594A] focus:outline-none"
+              >
+                <option value="en">English</option>
+                <option value="hi">Hindi (हिन्दी)</option>
+                <option value="kn">Kannada (ಕನ್ನಡ)</option>
+                <option value="same">Same as Conversation</option>
+              </select>
+            </div>
+          </div>
 
-                <button
-                  onClick={handleStartTranscription}
-                  disabled={isBusy}
-                  className="inline-flex items-center justify-center gap-2 bg-[#10594A] hover:bg-[#065C43] disabled:opacity-50 text-white text-sm font-semibold px-5 py-2.5 rounded-lg transition-colors cursor-pointer"
-                >
-                  {isBusy ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      Processing...
-                    </>
-                  ) : (
-                    "Transcribe Conversation"
-                  )}
-                </button>
+          <button
+            type="button"
+            onClick={handleTranscribe}
+            disabled={!selectedFile || isProcessing}
+            className="w-full rounded-xl bg-[#10594A] px-5 py-3 text-sm font-semibold text-white transition hover:bg-[#065C43] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {isProcessing ? "Processing Audio..." : "Transcribe & Summarize"}
+          </button>
+
+          {job && isProcessing && (
+            <div className="space-y-2 pt-2">
+              <div className="flex items-center justify-between text-xs font-medium text-neutral-700">
+                <span>{STATUS_LABELS[job.status] || job.status}</span>
+                <span>{job.progress}%</span>
+              </div>
+              <div className="h-2.5 w-full overflow-hidden rounded-full bg-neutral-200">
+                <div
+                  className="h-full rounded-full bg-[#10594A] transition-all duration-300"
+                  style={{ width: `${Math.max(job.progress, 5)}%` }}
+                />
               </div>
             </div>
           )}
 
-          <PipelineStatus status={status} />
-
           {errorMsg && (
-            <div className="flex items-center gap-2 text-sm text-red-700 bg-red-50 border border-red-200 p-3 rounded-lg">
-              <AlertCircle className="w-4 h-4 shrink-0" />
-              <span>{errorMsg}</span>
+            <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+              {errorMsg}
             </div>
           )}
         </section>
 
-        <TranscriptViewer
-          segments={segments}
-          activeSegmentId={activeSegmentId}
-          isPlaying={isPlaying}
-          filename={audioFile?.name || "transcript"}
-          onSelectSegment={handleSelectSegment}
-        />
+        {job?.status === "completed" && job.summary && <SummaryCard summary={job.summary} />}
+
+        {job?.status === "completed" && job.segments.length > 0 && (
+          <TranscriptViewer segments={job.segments} />
+        )}
       </div>
-    </div>
+    </main>
   );
 }

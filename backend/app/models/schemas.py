@@ -1,9 +1,5 @@
-from typing import List, Optional, Literal
+from typing import List, Optional
 from pydantic import BaseModel
-
-JobStatusType = Literal[
-    "queued", "normalizing", "diarizing", "transcribing", "completed", "failed"
-]
 
 
 class TranscriptSegment(BaseModel):
@@ -15,14 +11,18 @@ class TranscriptSegment(BaseModel):
     text: str
 
 
-class TranscribeCreateResponse(BaseModel):
-    job_id: str
-    status: JobStatusType
+class SummaryResult(BaseModel):
+    title: str
+    overview: str
+    key_takeaways: List[str]
+    action_items: List[str]
+    speaker_highlights: List[str]
 
 
 class JobStatusResponse(BaseModel):
     job_id: str
-    status: JobStatusType
-    filename: str
+    status: str
+    progress: int = 0
     error: Optional[str] = None
     segments: List[TranscriptSegment] = []
+    summary: Optional[SummaryResult] = None
